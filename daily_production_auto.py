@@ -3,19 +3,18 @@
 Daily Production Automation
 =============================
 Reads all crew daily report files from the 'Daily's' subfolder,
-extracts today's production values, updates the master template,
-and writes a crew/subcontractor contribution report.
+updates the master production template, and writes a crew/subcontractor
+contribution report.
 
 Each run:
+  - Syncs job rows in the template to match today's reports:
+      * Removes job rows that have no report today
+      * Adds new job rows for reports with jobs not yet in the template
   - Writes today's job-level footage into the correct rows
-  - Writes contractor-level DAILY sub-total formulas (auto-sum job rows)
-  - Writes top-level DAILY summary formulas
+  - Writes contractor DAILY subtotal formulas (auto-sum of job rows)
+  - Writes top-level daily summary formulas
   - Accumulates WEEKLY totals (resets each Monday)
   - Accumulates MONTHLY totals (resets on 1st of month)
-  - Updates the monthly table for the current month (O14:W25)
-  - Writes QUARTERLY formula rows (auto-sum monthly rows)
-  - Writes a YEARLY formula row
-  - Writes all dollar-value formula cells (footage x rate)
   - Saves a dated copy AND updates the master template file
 
 Usage:
@@ -40,30 +39,14 @@ except ImportError:
     sys.exit(1)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-BASE_DIR      = Path(r"c:\Users\JoshuaCollver\OneDrive\Working Folder for Claude.AI\Daily Production")
-DAILY_DIR     = BASE_DIR / "Daily's"
-TEMPLATE_FILE = BASE_DIR / "DAILY PRODUCTION TEMPLATE (7).xlsx"
-TEMPLATE_SHEET = "DAILY PRODUCTION TEMPLATE"
+BASE_DIR           = Path(r"c:\Users\JoshuaCollver\OneDrive\Working Folder for Claude.AI\Daily Production")
+DAILY_DIR          = BASE_DIR / "Daily's"
+PRODUCTION_DIR     = BASE_DIR / "Production Report"
+CREW_REPORT_DIR    = BASE_DIR / "Crew Report"
+TEMPLATE_FILE      = PRODUCTION_DIR / "DAILY PRODUCTION TEMPLATE (7).xlsx"
+TEMPLATE_SHEET     = "DAILY PRODUCTION TEMPLATE"
 
-# ── Contractor sections ────────────────────────────────────────────────────────
-# (name, first_job_row, last_job_row, daily_row, weekly_row, monthly_row)
-# first/last_job_row cover the FULL range including gap rows — SUM treats blanks as 0
-CONTRACTOR_SECTIONS = [
-    ("AT&T LG - 01",      11,  36,  37,  38,  39),
-    ("NATCO - 08",        41,  42,  43,  44,  45),
-    ("AT&T SVA - 01",     47,  63,  64,  65,  66),
-    ("WINDSTREAM",        68,  81,  82,  83,  84),
-    ("YELCOTT - 15",      86,  94,  95,  96,  97),
-    ("ARTEL - 12",        99, 101, 102, 103, 104),
-    ("FECC - 39",        106, 115, 116, 117, 118),
-    ("Southern Pipeline", None, None, 122, 123, 124),
-    ("AECC - 32",        131, 131, 132, 133, 134),
-]
-
-# Rows that hold contractor-level DAILY subtotals (used in top summary formulas)
-ALL_DAILY_ROWS = [37, 43, 64, 82, 95, 102, 116, 122, 132]
-
-# ── Job-area column letters (columns C–L) ─────────────────────────────────────
+# ── Work type → job row column (cols C–L) ─────────────────────────────────────
 JOB_COL = {
     "Bore":          "C",
     "Rock Bore":     "D",
@@ -76,120 +59,45 @@ JOB_COL = {
     "Cable":         "K",
     "Drops":         "L",
 }
+COMMENT_COL = "N"
 
-# ── Template daily/weekly/monthly update mapping (columns C–L → summary cells) ─
-# Template column letters for writing TODAY's job values
-TEMPLATE_COL = {
-    "Bore":        "C",
-    "Rock Bore":   "D",
-    "Trench":      "G",
-    "Trench Rock": "H",
-    "Plow":        "I",
-    "Aerial":      "J",
-    "Cable":       "K",
-    "Drops":       "L",
-}
-TEMPLATE_COMMENT_COL = "N"
-
-# ── Summary block cell addresses ───────────────────────────────────────────────
-# DAILY LF — these become formula cells (=SUM of contractor DAILY rows)
-DAILY_LF_CELL = {
-    "Bore":          "B3",
-    "Rock Bore":     "B4",
-    "Bore Inc":      "B5",
-    "Bore Rock Inc": "B6",
-    "Trench":        "I3",
-    "Trench Rock":   "I4",
-    "Plow":          "I5",
-    "Aerial":        "I6",
-    "Cable":         "I7",
-    "Drops":         "I8",
-}
-
-# WEEKLY LF — written as numbers by the script (accumulated)
-WEEKLY_CELL = {
-    "Bore":        "D3",
-    "Rock Bore":   "D4",
-    "Trench":      "K3",
-    "Trench Rock": "K4",
-    "Plow":        "K5",
-    "Aerial":      "K6",
-    "Cable":       "K7",
-    "Drops":       "K8",
-}
-
-# MONTHLY LF — written as numbers by the script (accumulated)
-MONTHLY_CELL = {
-    "Bore":        "F3",
-    "Rock Bore":   "F4",
-    "Trench":      "M3",
-    "Trench Rock": "M4",
-    "Plow":        "M5",
-    "Aerial":      "M6",
-    "Cable":       "M7",
-    "Drops":       "M8",
-}
-
-# ── Day-of-week breakdown table (rows 2-6, cols O-W) ──────────────────────────
-# Monday=row2, Tuesday=row3, Wednesday=row4, Thursday=row5, Friday=row6
-# Column O holds the day label; P-W hold the daily LF values.
-DAY_TABLE_FIRST_ROW = 2   # Monday
-DAY_TABLE_COL = {
-    "Drops":       "P",
-    "Bore":        "Q",
-    "Rock Bore":   "R",
-    "Trench":      "S",
-    "Trench Rock": "T",
-    "Plow":        "U",
-    "Aerial":      "V",
-    "Cable":       "W",
-}
-
-# Dollar value formulas: daily $, weekly $, monthly $ (column C-G and J-N)
-# Pattern: daily_lf_cell * rate,  weekly_lf_cell * rate,  monthly_lf_cell * rate
-DOLLAR_FORMULA_MAP = [
-    # (daily_$ cell, weekly_$ cell, monthly_$ cell, daily_lf_cell, weekly_lf_cell, monthly_lf_cell, rate_cell)
-    ("C3", "E3", "G3", "B3", "D3", "F3", "Y$15"),   # Bore
-    ("C4", "E4", "G4", "B4", "D4", "F4", "Z$15"),   # Rock Bore
-    ("J3", "L3", "N3", "I3", "K3", "M3", "AA$15"),  # Trench
-    ("J4", "L4", "N4", "I4", "K4", "M4", "AB$15"),  # Trench Rock
-    ("J5", "L5", "N5", "I5", "K5", "M5", "AC$15"),  # Plow
-    ("J6", "L6", "N6", "I6", "K6", "M6", "AD$15"),  # Aerial
-    ("J7", "L7", "N7", "I7", "K7", "M7", "AE$15"),  # Cable
-    ("J8", "L8", "N8", "I8", "K8", "M8", "AF$15"),  # Drops
-]
-
-# AD:AL value block — dollar values of daily/weekly/monthly by work type
-# AE–AL = Bore, Rock Bore, Trench, Trench Rock, Plow, Aerial, Cable, Drops
-AD_AL_MAP = [
-    # (daily_$ col, weekly_$ col, monthly_$ col, daily_lf_cell, weekly_lf_cell, monthly_lf_cell, rate)
-    ("AE", "B3", "D3", "F3", "Y$15"),   # Bore
-    ("AF", "B4", "D4", "F4", "Z$15"),   # Rock Bore
-    ("AG", "I3", "K3", "M3", "AA$15"),  # Trench
-    ("AH", "I4", "K4", "M4", "AB$15"),  # Trench Rock
-    ("AI", "I5", "K5", "M5", "AC$15"),  # Plow
-    ("AJ", "I6", "K6", "M6", "AD$15"),  # Aerial
-    ("AK", "I7", "K7", "M7", "AE$15"),  # Cable
-    ("AL", "I8", "K8", "M8", "AF$15"),  # Drops
-]
-
-# ── Monthly table (O14:W25) ────────────────────────────────────────────────────
-MONTH_TABLE_START_ROW = 14   # row 14 = JAN, row 25 = DEC
-MONTH_TABLE_COL = {
-    "Bore":        "Q",
-    "Rock Bore":   "R",
-    "Trench":      "S",
-    "Trench Rock": "T",
-    "Plow":        "U",
-    "Aerial":      "V",
-    "Cable":       "W",
-    "Drops":       "P",
-}
-MONTHLY_TABLE_COLS = ["P", "Q", "R", "S", "T", "U", "V", "W"]
-QUARTERLY_START_ROW = 27     # Q1=27, Q2=28, Q3=29, Q4=30
-YEARLY_ROW = 31
-
+# Work types read from crew reports (subset of JOB_COL — no Bore Inc variants)
 WORK_TYPES = ["Bore", "Rock Bore", "Trench", "Trench Rock", "Plow", "Aerial", "Cable", "Drops"]
+
+# ── Summary block (rows 3–12) ──────────────────────────────────────────────────
+# Col A = label, Col B = daily LF, Col D = weekly LF, Col F = monthly LF
+# Col C = daily $, Col E = weekly $, Col G = monthly $ (formula cells — left to Excel)
+SUMMARY_ROWS = {
+    "Bore":          3,
+    "Rock Bore":     4,
+    "Bore Inc":      5,
+    "Bore Rock Inc": 6,
+    "Trench":        7,
+    "Trench Rock":   8,
+    "Plow":          9,
+    "Aerial":        10,
+    "Cable":         11,
+    "Drops":         12,
+}
+DATE_CELL = "A1"   # date of last run
+
+# ── Contractor definitions ─────────────────────────────────────────────────────
+# (section_type, job_number_prefix, pattern found in column A of template)
+CONTRACTOR_DEFS = [
+    ("LG",         "01", "AT&T LG"),
+    ("NATCO",      "08", "NATCO"),
+    ("SVA",        "01", "AT&T SVA"),
+    ("WINDSTREAM", "02", "WINDSTREAM"),
+    ("YELCOTT",    "15", "YELCOTT"),
+    ("ARTEL",      "12", "ARTEL"),
+    ("FECC",       "39", "FECC"),
+    ("PIPELINE",   None, "SOUTHERN PIPELINE"),
+    ("AECC",       "32", "AECC"),
+]
+
+# ── Regex ──────────────────────────────────────────────────────────────────────
+JOB_RE        = re.compile(r"\d{2}[-/]\d{4}[-/]\d{2}")
+JOB_NUMBER_RE = re.compile(r"^\d{2}-\d{4}-\d{2}$")
 
 # ── Header patterns for daily report layout detection ─────────────────────────
 HEADER_PATTERNS = [
@@ -207,12 +115,9 @@ HEADER_PATTERNS = [
     ("date",         "Date"),
 ]
 
-JOB_RE = re.compile(r"\d{2}[-/]\d{4}[-/]\d{2}")
-JOB_NUMBER_RE = re.compile(r"^\d{2}-\d{4}-\d{2}$")
-
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Utility helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _to_num(v):
@@ -321,6 +226,62 @@ def detect_layout(ws):
     }
 
 
+def _parse_footage_from_notes(text: str) -> dict:
+    """
+    Extract footage values from a remark/notes string for cases where a
+    supervisor described work in text without filling in the numeric cells.
+
+    Patterns recognized (case-insensitive):
+      - "NUMBER' KEYWORD"   e.g. "300' bore", "1,200' aerial"
+      - "KEYWORD NUMBER'"   e.g. "bore 300'", "plowed 580'"
+      - "KEYWORD=NUMBER'"   e.g. "bfov(1)(1.25)=580'"
+
+    Only counts footage NOT flagged as incomplete ("inc", "incomplete").
+    Returns a dict with the same keys as WORK_TYPES, defaulting to 0.
+    """
+    totals = {wt: 0.0 for wt in WORK_TYPES}
+
+    # Normalize: remove commas in numbers, lowercase
+    text = re.sub(r"(\d),(\d)", r"\1\2", text)   # 1,036 → 1036
+    text_lc = text.lower()
+
+    # Keyword → work type mapping (longer/more-specific patterns first)
+    KW_MAP = [
+        (r"rock\s*bore",  "Rock Bore"),
+        (r"rock\s*trench","Trench Rock"),
+        (r"\bbore[d]?\b", "Bore"),
+        (r"\btrench[ed]?\b","Trench"),
+        (r"\bplow[ed]?\b", "Plow"),
+        (r"\baerial\b",   "Aerial"),
+        (r"\bcable\b",    "Cable"),
+        (r"\bfiber\b",    "Cable"),
+        (r"\bco\d+\b",    "Cable"),   # co24, co96, co144 etc.
+        (r"\bdrop[s]?\b", "Drops"),
+    ]
+
+    # Pattern: NUMBER' KEYWORD  or  KEYWORD NUMBER'  or  KEYWORD=NUMBER'
+    number_pat = r"(\d+(?:\.\d+)?)'?"
+
+    for kw_re, wt in KW_MAP:
+        # "KEYWORD ... NUMBER'" pattern
+        for m in re.finditer(rf"{kw_re}\s*[=:\s]\s*{number_pat}", text_lc):
+            start = m.start()
+            # Skip if the word "inc" follows closely (incomplete work)
+            after = text_lc[m.end():m.end() + 20]
+            if re.search(r"\binc(omplete)?\b", after):
+                continue
+            totals[wt] += float(m.group(1))
+
+        # "NUMBER' KEYWORD" pattern
+        for m in re.finditer(rf"{number_pat}\s*'?\s*(?:of\s+)?{kw_re}", text_lc):
+            after = text_lc[m.end():m.end() + 20]
+            if re.search(r"\binc(omplete)?\b", after):
+                continue
+            totals[wt] += float(m.group(1))
+
+    return totals
+
+
 def read_daily_report(filepath: Path, target_date: date) -> dict:
     wb = openpyxl.load_workbook(filepath, data_only=True)
     ws = wb.active
@@ -341,10 +302,26 @@ def read_daily_report(filepath: Path, target_date: date) -> dict:
         "used_last_entry": False,
     }
 
+    consecutive_empty = 0   # rows with no date AND no other data
+
     for row_tuple in ws.iter_rows(min_row=layout["data_start"], values_only=True):
         date_val = row_tuple[col.get("Date", 0)] if col.get("Date", 0) < len(row_tuple) else None
+
         if date_val is None:
-            break
+            # Check if the row has ANY meaningful non-zero content
+            has_content = any(
+                v is not None and v != 0 and str(v).strip()
+                for v in row_tuple
+            )
+            if not has_content:
+                consecutive_empty += 1
+                if consecutive_empty >= 5:
+                    break   # past the end of real data
+            else:
+                consecutive_empty = 0   # note-only row — keep scanning
+            continue
+
+        consecutive_empty = 0
         row_date = _to_date(date_val)
         if row_date is None:
             continue
@@ -353,7 +330,14 @@ def read_daily_report(filepath: Path, target_date: date) -> dict:
             idx = col.get(key)
             return _to_num(row_tuple[idx]) if idx is not None and idx < len(row_tuple) else 0.0
 
-        # "Rock Trench" in daily reports maps to "Trench Rock" in our WORK_TYPES
+        remarks_idx = col.get("Remarks")
+        remarks_val = (
+            row_tuple[remarks_idx]
+            if remarks_idx is not None and remarks_idx < len(row_tuple)
+            else None
+        )
+        remarks_text = str(remarks_val).strip() if remarks_val else ""
+
         entry = {
             "date":        row_date,
             "Plow":        gc("Plow"),
@@ -365,8 +349,21 @@ def read_daily_report(filepath: Path, target_date: date) -> dict:
             "Cable":       gc("Cable"),
             "Drops":       gc("Drops"),
             "total":       gc("Daily Total"),
-            "remarks":     str(row_tuple[col["Remarks"]] if col.get("Remarks") and col["Remarks"] < len(row_tuple) and row_tuple[col["Remarks"]] else "").strip(),
+            "remarks":     remarks_text,
         }
+
+        # If all footage cells are zero but remarks contain footage descriptions,
+        # extract values from the notes text.
+        cell_total = sum(entry[wt] for wt in WORK_TYPES)
+        if cell_total == 0 and remarks_text:
+            note_vals = _parse_footage_from_notes(remarks_text)
+            note_total = sum(note_vals.values())
+            if note_total > 0:
+                for wt in WORK_TYPES:
+                    entry[wt] = note_vals[wt]
+                entry["total"]   = note_total
+                entry["remarks"] = f"[from notes] {remarks_text}"
+
         report["all_entries"].append(entry)
 
     target_entries = [e for e in report["all_entries"] if e["date"] == target_date]
@@ -413,10 +410,61 @@ def deduplicate_reports(reports: list) -> tuple:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Template job-row map
+# Template structure discovery
 # ═════════════════════════════════════════════════════════════════════════════
 
+def discover_sections(ws) -> list:
+    """
+    Scan template column A for contractor headers, then find job rows and
+    DAILY/WEEKLY/MONTHLY total rows within each section.
+    Returns list of section dicts sorted by header_row.
+    """
+    max_row  = ws.max_row
+    sections = []
+
+    for row_num in range(1, max_row + 1):
+        a_val = ws.cell(row=row_num, column=1).value
+        if not a_val or not isinstance(a_val, str):
+            continue
+        a_upper = a_val.strip().upper()
+        for ctype, prefix, pattern in CONTRACTOR_DEFS:
+            if pattern.upper() in a_upper:
+                sections.append({
+                    "name":        a_val.strip(),
+                    "type":        ctype,
+                    "prefix":      prefix,
+                    "header_row":  row_num,
+                    "job_rows":    [],
+                    "daily_row":   None,
+                    "weekly_row":  None,
+                    "monthly_row": None,
+                })
+                break
+
+    sections.sort(key=lambda s: s["header_row"])
+
+    for i, sec in enumerate(sections):
+        start = sec["header_row"]
+        end   = sections[i + 1]["header_row"] - 1 if i + 1 < len(sections) else max_row
+        for row_num in range(start, end + 1):
+            b_val = ws.cell(row=row_num, column=2).value
+            if b_val is None:
+                continue
+            b_str = str(b_val).strip()
+            if JOB_NUMBER_RE.match(b_str):
+                sec["job_rows"].append(row_num)
+            elif b_str.upper() == "DAILY":
+                sec["daily_row"] = row_num
+            elif b_str.upper() == "WEEKLY":
+                sec["weekly_row"] = row_num
+            elif b_str.upper() == "MONTHLY":
+                sec["monthly_row"] = row_num
+
+    return sections
+
+
 def build_job_row_map(ws) -> dict:
+    """Return {job_number: row_number} for every job row in the template."""
     mapping = {}
     for row in ws.iter_rows(min_col=2, max_col=2):
         cell = row[0]
@@ -428,94 +476,131 @@ def build_job_row_map(ws) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Contractor type for new jobs
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_contractor_type(report: dict) -> str | None:
+    """
+    Determine which contractor section a job belongs to.
+    For 01-prefix jobs, check the filename for 'SVA' vs 'LG'.
+    """
+    filename = (report.get("filename") or "").upper()
+    job_num  = report.get("job_number") or ""
+    prefix   = job_num[:2] if len(job_num) >= 2 else ""
+
+    if prefix == "01":
+        return "SVA" if "SVA" in filename else "LG"
+
+    return {
+        "08": "NATCO",
+        "02": "WINDSTREAM",
+        "15": "YELCOTT",
+        "12": "ARTEL",
+        "39": "FECC",
+        "32": "AECC",
+    }.get(prefix)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job sync  (add new rows / remove rows with no report)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _remove_job_row(ws, row_num):
+    """Delete a job row, preserving the contractor label if it lives in col A."""
+    a_val = ws.cell(row=row_num, column=1).value
+    if a_val and isinstance(a_val, str):
+        # Move contractor name to the row below before deleting
+        ws.cell(row=row_num + 1, column=1, value=a_val)
+    ws.delete_rows(row_num)
+
+
+def _add_job_row(ws, section, job_number):
+    """Insert a blank job row just before the section's DAILY total row."""
+    insert_at = section["daily_row"]
+    ws.insert_rows(insert_at)
+    ws.cell(row=insert_at, column=2, value=job_number)
+    # If this is the first job row in the section, put the contractor name in col A
+    if not section["job_rows"]:
+        ws.cell(row=insert_at, column=1, value=section["name"])
+
+
+def sync_jobs(ws, reports: list) -> tuple:
+    """
+    Sync template job rows with today's reports:
+      - Removes rows whose job numbers are absent from today's reports
+      - Adds rows for job numbers that appear in reports but not the template
+    Returns (added, removed) lists of job numbers.
+    """
+    sections    = discover_sections(ws)
+    job_row_map = build_job_row_map(ws)
+    report_jobs = {r["job_number"]: r for r in reports if r["job_number"]}
+
+    to_remove = [jn for jn in job_row_map if jn not in report_jobs]
+    to_add    = [(jn, r) for jn, r in report_jobs.items() if jn not in job_row_map]
+
+    removed = []
+    added   = []
+
+    # Remove from bottom to top so earlier row numbers stay valid
+    rows_to_remove = sorted(
+        [(job_row_map[jn], jn) for jn in to_remove],
+        reverse=True,
+    )
+    for row_num, jn in rows_to_remove:
+        _remove_job_row(ws, row_num)
+        removed.append(jn)
+
+    # Re-discover after removals
+    if removed:
+        sections = discover_sections(ws)
+
+    # Add new jobs to their correct contractor section
+    for job_num, report in to_add:
+        ctype      = get_contractor_type(report)
+        target_sec = next((s for s in sections if s["type"] == ctype), None)
+        if target_sec and target_sec["daily_row"] is not None:
+            _add_job_row(ws, target_sec, job_num)
+            added.append(job_num)
+            # Re-discover after each insertion to keep row numbers current
+            sections = discover_sections(ws)
+        else:
+            print(f"  WARNING: No section found for job {job_num} (contractor type: {ctype})")
+
+    return added, removed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Formula writers
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _sum_ref(col, rows):
-    """Build =SUM(C37,C43,...) style formula from a column letter and list of rows."""
-    refs = ",".join(f"{col}{r}" for r in rows)
-    return f"=SUM({refs})"
-
-
-def write_formulas(ws):
+def write_formulas(ws, sections: list):
     """
-    Write all structural Excel formulas into the worksheet.
-    These formulas auto-recalculate when Excel opens the file.
-
-    Formulas written:
-      - Contractor DAILY rows: =SUM(job-row range)
-      - Top DAILY summary (B3/B4/I3-I8): =SUM(contractor DAILY cells)
-      - Dollar value cells (C3,E3,G3,J3-N8,AE3-AL5): = LF * rate
-      - Dollar subtotals (Y17:Y19): =SUM(AE:AL row)
-      - Quarterly rows (O27:W30): =SUM(3 monthly rows)
-      - Yearly row (O31:W31): =SUM(all 12 monthly rows)
+    Write structural Excel formulas:
+      1. Each contractor DAILY row: =SUM(job rows) for each work-type column
+      2. Summary daily LF cells (col B, rows 3–12): =SUM(all contractor DAILY rows)
+    Dollar-value cells (C, E, G in the summary block) are left as-is so Excel
+    recalculates them from the existing rate formulas in the template.
     """
-
-    # ── 1. Contractor DAILY rows: =SUM(C{first}:C{last}) ──────────────────
-    for _, first_row, last_row, daily_row, _, _ in CONTRACTOR_SECTIONS:
-        if first_row is None:
-            # No job rows (e.g., Southern Pipeline) — set to 0
-            for col in JOB_COL.values():
-                ws[f"{col}{daily_row}"] = 0
+    # 1. Contractor DAILY rows
+    for sec in sections:
+        if not sec["job_rows"] or sec["daily_row"] is None:
             continue
+        first_job = sec["job_rows"][0]
+        last_job  = sec["job_rows"][-1]
         for col in JOB_COL.values():
-            ws[f"{col}{daily_row}"] = f"=SUM({col}{first_row}:{col}{last_row})"
+            ws[f"{col}{sec['daily_row']}"] = f"=SUM({col}{first_job}:{col}{last_job})"
 
-    # ── 2. Top DAILY summary formulas ─────────────────────────────────────
-    # Map each work type to its job-area column, then sum across all contractor DAILY rows
-    daily_col_map = {
-        "Bore":          "C",
-        "Rock Bore":     "D",
-        "Bore Inc":      "E",
-        "Bore Rock Inc": "F",
-        "Trench":        "G",
-        "Trench Rock":   "H",
-        "Plow":          "I",
-        "Aerial":        "J",
-        "Cable":         "K",
-        "Drops":         "L",
-    }
-    for wt, summary_cell in DAILY_LF_CELL.items():
-        col = daily_col_map[wt]
-        ws[summary_cell] = _sum_ref(col, ALL_DAILY_ROWS)
-
-    # ── 3. Dollar value cells in summary block (rows 3-8) ─────────────────
-    for daily_cell, weekly_cell, monthly_cell, d_lf, w_lf, m_lf, rate in DOLLAR_FORMULA_MAP:
-        ws[daily_cell]   = f"={d_lf}*{rate}"
-        ws[weekly_cell]  = f"={w_lf}*{rate}"
-        ws[monthly_cell] = f"={m_lf}*{rate}"
-
-    # ── 4. AD:AL block (rows 3-5): daily/weekly/monthly $ per work type ───
-    for col_letter, d_lf, w_lf, m_lf, rate in AD_AL_MAP:
-        ws[f"{col_letter}3"] = f"={d_lf}*{rate}"   # DAILY $
-        ws[f"{col_letter}4"] = f"={w_lf}*{rate}"   # WEEKLY $
-        ws[f"{col_letter}5"] = f"={m_lf}*{rate}"   # MONTHLY $
-
-    # ── 5. Dollar subtotals (Y17:Y19) ─────────────────────────────────────
-    ws["Y17"] = "=SUM(AE3:AL3)"   # Daily total $
-    ws["Y18"] = "=SUM(AE4:AL4)"   # Weekly total $
-    ws["Y19"] = "=SUM(AE5:AL5)"   # Monthly total $
-
-    # ── 6. Quarterly formulas (O27:W30) ───────────────────────────────────
-    # Q1=JAN/FEB/MAR (rows 14-16), Q2=APR-JUN (17-19), Q3=JUL-SEP (20-22), Q4=OCT-DEC (23-25)
-    quarter_ranges = [
-        (QUARTERLY_START_ROW + 0, 14, 16),  # Q1
-        (QUARTERLY_START_ROW + 1, 17, 19),  # Q2
-        (QUARTERLY_START_ROW + 2, 20, 22),  # Q3
-        (QUARTERLY_START_ROW + 3, 23, 25),  # Q4
-    ]
-    ws[f"O{QUARTERLY_START_ROW + 0}"] = "Q1"
-    ws[f"O{QUARTERLY_START_ROW + 1}"] = "Q2"
-    ws[f"O{QUARTERLY_START_ROW + 2}"] = "Q3"
-    ws[f"O{QUARTERLY_START_ROW + 3}"] = "Q4"
-    for q_row, m_start, m_end in quarter_ranges:
-        for col in MONTHLY_TABLE_COLS:
-            ws[f"{col}{q_row}"] = f"=SUM({col}{m_start}:{col}{m_end})"
-
-    # ── 7. Yearly formula row ──────────────────────────────────────────────
-    ws[f"O{YEARLY_ROW}"] = "YEARLY"
-    for col in MONTHLY_TABLE_COLS:
-        ws[f"{col}{YEARLY_ROW}"] = f"=SUM({col}{MONTH_TABLE_START_ROW}:{col}{MONTH_TABLE_START_ROW + 11})"
+    # 2. Summary daily LF — col B, rows 3–12
+    # Summary Bore (B3) = SUM of col C across all DAILY rows  (C = bore column in job rows)
+    # Summary Rock Bore (B4) = SUM of col D across all DAILY rows, etc.
+    daily_rows = [sec["daily_row"] for sec in sections if sec["daily_row"] is not None]
+    if daily_rows:
+        for wt, row_num in SUMMARY_ROWS.items():
+            job_col = JOB_COL.get(wt)
+            if not job_col:
+                continue
+            refs = ",".join(f"{job_col}{r}" for r in daily_rows)
+            ws[f"B{row_num}"] = f"=SUM({refs})"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -524,24 +609,28 @@ def write_formulas(ws):
 
 def accumulate_periods(ws, daily_totals: dict, target_date: date):
     """
-    Update weekly and monthly accumulated LF values in the summary block.
-    Uses A2 to detect the last processed date and determine resets.
-    Also updates the monthly table row for the current month.
+    Update weekly (col D) and monthly (col F) accumulated LF in summary block.
+    Reads last-run date from A1 to detect week/month boundaries.
     """
-    # Read last processed date from A2
     last_run = None
-    raw = ws["A2"].value
+    raw = ws[DATE_CELL].value
     if raw:
-        try:
-            last_run = datetime.strptime(str(raw).strip(), "%m/%d/%Y").date()
-        except (ValueError, AttributeError):
-            pass
+        if isinstance(raw, datetime):
+            last_run = raw.date()
+        elif isinstance(raw, date):
+            last_run = raw
+        elif isinstance(raw, str):
+            for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+                try:
+                    last_run = datetime.strptime(raw.strip(), fmt).date()
+                    break
+                except ValueError:
+                    pass
 
     if last_run == target_date:
         print("  (accumulation skipped — already processed today)")
         return
 
-    # Determine period boundaries
     new_week  = True
     new_month = True
     if last_run:
@@ -550,55 +639,31 @@ def accumulate_periods(ws, daily_totals: dict, target_date: date):
         if last_run.month == target_date.month and last_run.year == target_date.year:
             new_month = False
 
-    period_label = []
-    if new_week:
-        period_label.append("new week")
-    if new_month:
-        period_label.append("new month")
-    if period_label:
-        print(f"  (period reset: {', '.join(period_label)})")
+    labels = []
+    if new_week:  labels.append("new week")
+    if new_month: labels.append("new month")
+    if labels:
+        print(f"  (period reset: {', '.join(labels)})")
 
-    # Update weekly and monthly LF cells
     for wt in WORK_TYPES:
-        today_val    = daily_totals.get(wt, 0.0)
-        weekly_cell  = WEEKLY_CELL.get(wt)
-        monthly_cell = MONTHLY_CELL.get(wt)
+        row_num   = SUMMARY_ROWS.get(wt)
+        today_val = daily_totals.get(wt, 0.0)
+        if not row_num:
+            continue
 
-        if weekly_cell:
-            if new_week:
-                ws[weekly_cell] = round(today_val) if today_val else 0
-            else:
-                existing = _to_num(ws[weekly_cell].value)
-                ws[weekly_cell] = round(existing + today_val) if (existing + today_val) else 0
+        # Weekly LF → col D
+        if new_week:
+            ws[f"D{row_num}"] = round(today_val) if today_val else 0
+        else:
+            existing = _to_num(ws[f"D{row_num}"].value)
+            ws[f"D{row_num}"] = round(existing + today_val) if (existing + today_val) else 0
 
-        if monthly_cell:
-            if new_month:
-                ws[monthly_cell] = round(today_val) if today_val else 0
-            else:
-                existing = _to_num(ws[monthly_cell].value)
-                ws[monthly_cell] = round(existing + today_val) if (existing + today_val) else 0
-
-    # Sync monthly table row for current month with the accumulated monthly values
-    month_row = MONTH_TABLE_START_ROW + target_date.month - 1   # JAN=14 ... DEC=25
-    for wt, col in MONTH_TABLE_COL.items():
-        monthly_cell = MONTHLY_CELL.get(wt)
-        if monthly_cell:
-            ws[f"{col}{month_row}"] = ws[monthly_cell].value
-
-    # ── Update day-of-week breakdown table (O2:W6) ────────────────────────
-    weekday = target_date.weekday()   # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
-    if weekday <= 4:                  # skip Saturday / Sunday
-        # On Monday (start of new week) clear the whole table first so
-        # stale data from the prior week doesn't linger in Tue-Fri rows.
-        if new_week or weekday == 0:
-            for r in range(DAY_TABLE_FIRST_ROW, DAY_TABLE_FIRST_ROW + 5):
-                for col in DAY_TABLE_COL.values():
-                    ws[f"{col}{r}"] = None
-
-        day_row = DAY_TABLE_FIRST_ROW + weekday   # Mon=2, Tue=3, ...
-        for wt, col in DAY_TABLE_COL.items():
-            v = daily_totals.get(wt, 0.0)
-            ws[f"{col}{day_row}"] = round(v) if v else None
+        # Monthly LF → col F
+        if new_month:
+            ws[f"F{row_num}"] = round(today_val) if today_val else 0
+        else:
+            existing = _to_num(ws[f"F{row_num}"].value)
+            ws[f"F{row_num}"] = round(existing + today_val) if (existing + today_val) else 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -608,14 +673,30 @@ def accumulate_periods(ws, daily_totals: dict, target_date: date):
 def update_template(reports: list, target_date: date,
                     output_path: Path, dry_run: bool) -> tuple:
 
-    wb  = openpyxl.load_workbook(TEMPLATE_FILE)
-    ws  = wb[TEMPLATE_SHEET]
+    wb = openpyxl.load_workbook(TEMPLATE_FILE)
+    ws = wb[TEMPLATE_SHEET]
+
+    # ── 1. Sync job rows (add new, remove stale) ──────────────────────────
+    added, removed = sync_jobs(ws, reports)
+    if added:
+        print(f"  Added {len(added)} new job(s):    {', '.join(sorted(added))}")
+    if removed:
+        print(f"  Removed {len(removed)} old job(s): {', '.join(sorted(removed))}")
+
+    # ── 2. Re-discover structure after sync ───────────────────────────────
+    sections    = discover_sections(ws)
     job_row_map = build_job_row_map(ws)
 
     matched   = []
     unmatched = []
 
-    # ── Write today's job-level footage ───────────────────────────────────
+    # ── 3. Clear all job-row footage so stale values don't linger ─────────
+    for row_num in job_row_map.values():
+        for col in JOB_COL.values():
+            ws[f"{col}{row_num}"] = None
+        ws[f"{COMMENT_COL}{row_num}"] = None
+
+    # ── 4. Write today's job-level footage ────────────────────────────────
     for report in reports:
         job_num = report["job_number"]
         if not job_num:
@@ -627,41 +708,41 @@ def update_template(reports: list, target_date: date,
             continue
 
         vals = report["today_values"]
-        for wt, col in TEMPLATE_COL.items():
+        for wt, col in JOB_COL.items():
             v = vals.get(wt, 0.0)
-            ws[f"{col}{row_num}"] = round(v) if v else None
+            if v:
+                ws[f"{col}{row_num}"] = round(v)
 
-        remarks_text = " | ".join(report["today_remarks"])
-        if remarks_text:
-            ws[f"{TEMPLATE_COMMENT_COL}{row_num}"] = remarks_text
+        remarks = " | ".join(report["today_remarks"])
+        if remarks:
+            ws[f"{COMMENT_COL}{row_num}"] = remarks
 
         matched.append(report)
 
-    # ── Compute overall daily totals (across all reports) ─────────────────
+    # ── 5. Compute overall daily totals ───────────────────────────────────
     daily_totals = {wt: 0.0 for wt in WORK_TYPES}
     for report in reports:
         for wt in WORK_TYPES:
             daily_totals[wt] += report["today_values"].get(wt, 0.0)
 
-    # ── Accumulate weekly / monthly ───────────────────────────────────────
+    # ── 6. Write structural formulas ──────────────────────────────────────
+    write_formulas(ws, sections)
+
+    # ── 7. Accumulate weekly / monthly ────────────────────────────────────
     accumulate_periods(ws, daily_totals, target_date)
 
-    # ── Write all structural formulas ─────────────────────────────────────
-    write_formulas(ws)
+    # ── 8. Stamp date ─────────────────────────────────────────────────────
+    ws[DATE_CELL] = target_date.strftime("%m/%d/%Y")
 
-    # ── Stamp processing date ─────────────────────────────────────────────
-    ws["A2"] = target_date.strftime("%m/%d/%Y")
-
-    # ── Save ──────────────────────────────────────────────────────────────
+    # ── 9. Save ───────────────────────────────────────────────────────────
     if not dry_run:
         wb.save(output_path)
-        # Also update the master template so accumulated values persist for tomorrow
         try:
             wb.save(TEMPLATE_FILE)
             print(f"  Master template updated: {TEMPLATE_FILE.name}")
         except PermissionError:
             print(f"  WARNING: Could not update master template (file may be open in Excel).")
-            print(f"  Close the template and re-run, or copy {output_path.name} over it manually.")
+            print(f"  Close Excel and re-run, or copy {output_path.name} over it manually.")
 
     return matched, unmatched
 
@@ -880,8 +961,12 @@ def main():
         target_date = date.today()
 
     date_str        = target_date.strftime("%m-%d-%Y")
-    output_template = BASE_DIR / f"Daily Production {date_str}.xlsx"
-    output_crew     = BASE_DIR / f"Crew Report {date_str}.xlsx"
+    output_template = PRODUCTION_DIR  / f"Daily Production {date_str}.xlsx"
+    output_crew     = CREW_REPORT_DIR / f"Crew Report {date_str}.xlsx"
+
+    # Look for reports in a date subfolder (YYYYMMDD) first, fall back to root Daily's/
+    date_subfolder = DAILY_DIR / target_date.strftime("%Y%m%d")
+    reports_dir    = date_subfolder if date_subfolder.is_dir() else DAILY_DIR
 
     sep = "-" * 72
     print(f"\n{sep}")
@@ -889,13 +974,17 @@ def main():
     if dry_run:
         print("  [DRY RUN -- no files will be saved]")
     print(sep)
-    print(f"\nReading reports from: {DAILY_DIR}\n")
+    print(f"\nReading reports from: {reports_dir}\n")
 
     # ── Read all daily reports ─────────────────────────────────────────────
     raw_reports = []
     errors      = []
 
-    for xlsx_file in sorted(DAILY_DIR.glob("*.xlsx")):
+    # Only read .xlsx files that look like crew reports (skip templates, scripts, etc.)
+    SKIP_PATTERNS = ("daily production template", "daily_production_auto")
+    for xlsx_file in sorted(reports_dir.glob("*.xlsx")):
+        if any(p in xlsx_file.name.lower() for p in SKIP_PATTERNS):
+            continue
         try:
             raw_reports.append(read_daily_report(xlsx_file, target_date))
         except Exception as exc:
@@ -922,12 +1011,12 @@ def main():
 
     # ── Update master template ─────────────────────────────────────────────
     print(f"\n{sep}")
-    print("  Updating master template and writing formulas...")
+    print("  Syncing jobs and updating template...")
     matched, unmatched = update_template(reports, target_date, output_template, dry_run)
     print(f"  Matched {len(matched)} jobs  |  {len(unmatched)} unmatched")
 
     if unmatched:
-        print("\n  Jobs NOT found in template (add manually):")
+        print("\n  Jobs NOT matched (no section found — add contractor section manually):")
         for r in unmatched:
             print(f"    X  {(r['job_number'] or 'NO JOB#'):<22}  {r['filename']}")
 
