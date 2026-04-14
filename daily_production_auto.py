@@ -236,7 +236,8 @@ def _parse_footage_from_notes(text: str) -> dict:
       - "KEYWORD NUMBER'"   e.g. "bore 300'", "plowed 580'"
       - "KEYWORD=NUMBER'"   e.g. "bfov(1)(1.25)=580'"
 
-    Only counts footage NOT flagged as incomplete ("inc", "incomplete").
+    Incomplete work ("inc"/"incomplete") is skipped for bore/aerial/cable/drops.
+    For trench and trench rock, incomplete footage IS counted per user preference.
     Returns a dict with the same keys as WORK_TYPES, defaulting to 0.
     """
     totals = {wt: 0.0 for wt in WORK_TYPES}
@@ -245,37 +246,49 @@ def _parse_footage_from_notes(text: str) -> dict:
     text = re.sub(r"(\d),(\d)", r"\1\2", text)   # 1,036 → 1036
     text_lc = text.lower()
 
+    # Work types where incomplete ("inc") footage should still be counted
+    COUNT_INCOMPLETE = {"Trench", "Trench Rock"}
+
     # Keyword → work type mapping (longer/more-specific patterns first)
     KW_MAP = [
-        (r"rock\s*bore",  "Rock Bore"),
-        (r"rock\s*trench","Trench Rock"),
-        (r"\bbore[d]?\b", "Bore"),
-        (r"\btrench[ed]?\b","Trench"),
-        (r"\bplow[ed]?\b", "Plow"),
-        (r"\baerial\b",   "Aerial"),
-        (r"\bcable\b",    "Cable"),
-        (r"\bfiber\b",    "Cable"),
-        (r"\bco\d+\b",    "Cable"),   # co24, co96, co144 etc.
-        (r"\bdrop[s]?\b", "Drops"),
+        (r"rock\s*bore",      "Rock Bore"),
+        (r"rock\s*trench",    "Trench Rock"),
+        (r"rock\s*saw",       "Trench Rock"),   # "40' rock saw" = Trench Rock
+        (r"\bbore[d]?\b",     "Bore"),
+        (r"\btrench[ed]?\b",  "Trench"),
+        (r"\bplow[ed]?\b",    "Plow"),
+        (r"\baerial\b",       "Aerial"),
+        (r"\bcable\b",        "Cable"),
+        (r"\bfiber\b",        "Cable"),
+        (r"\bco\d+\b",        "Cable"),   # co24, co96, co144 etc.
+        (r"\bdrop[s]?\b",     "Drops"),
     ]
 
     # Pattern: NUMBER' KEYWORD  or  KEYWORD NUMBER'  or  KEYWORD=NUMBER'
     number_pat = r"(\d+(?:\.\d+)?)'?"
 
+    # Words after a match that indicate removal/decommissioning rather than
+    # new installation — skip those matches entirely for all work types.
+    REMOVAL_RE = re.compile(r"\b(?:delash|wreck|remov|demo|pull\s+out|take\s+out)")
+
     for kw_re, wt in KW_MAP:
+        skip_inc = wt not in COUNT_INCOMPLETE
+
         # "KEYWORD ... NUMBER'" pattern
         for m in re.finditer(rf"{kw_re}\s*[=:\s]\s*{number_pat}", text_lc):
-            start = m.start()
-            # Skip if the word "inc" follows closely (incomplete work)
-            after = text_lc[m.end():m.end() + 20]
-            if re.search(r"\binc(omplete)?\b", after):
+            after = text_lc[m.end():m.end() + 30]
+            if REMOVAL_RE.search(after):
+                continue
+            if skip_inc and re.search(r"\binc(omplete)?\b", after):
                 continue
             totals[wt] += float(m.group(1))
 
         # "NUMBER' KEYWORD" pattern
         for m in re.finditer(rf"{number_pat}\s*'?\s*(?:of\s+)?{kw_re}", text_lc):
-            after = text_lc[m.end():m.end() + 20]
-            if re.search(r"\binc(omplete)?\b", after):
+            after = text_lc[m.end():m.end() + 30]
+            if REMOVAL_RE.search(after):
+                continue
+            if skip_inc and re.search(r"\binc(omplete)?\b", after):
                 continue
             totals[wt] += float(m.group(1))
 
@@ -303,28 +316,47 @@ def read_daily_report(filepath: Path, target_date: date) -> dict:
     }
 
     consecutive_empty = 0   # rows with no date AND no other data
+    last_date = None        # carry forward when a supervisor omits the date on a continuation row
 
     for row_tuple in ws.iter_rows(min_row=layout["data_start"], values_only=True):
         date_val = row_tuple[col.get("Date", 0)] if col.get("Date", 0) < len(row_tuple) else None
 
         if date_val is None:
-            # Check if the row has ANY meaningful non-zero content
-            has_content = any(
+            # Check if the row has ANY meaningful numeric footage content
+            # (ignore text-only note rows — those don't carry a date forward)
+            has_footage = any(
+                isinstance(v, (int, float)) and v != 0
+                for idx, v in enumerate(row_tuple)
+                if idx != col.get("Date", 0)
+            )
+            has_any_content = any(
                 v is not None and v != 0 and str(v).strip()
                 for v in row_tuple
             )
-            if not has_content:
+            if not has_any_content:
                 consecutive_empty += 1
                 if consecutive_empty >= 5:
                     break   # past the end of real data
-            else:
-                consecutive_empty = 0   # note-only row — keep scanning
-            continue
+                continue
 
-        consecutive_empty = 0
+            consecutive_empty = 0
+
+            # Continuation row (numeric footage or note text) with no date —
+            # attribute it to the same date as the previous row.  This covers:
+            #   • Multi-crew rows where the supervisor only wrote the date once
+            #   • Text-only note rows that describe work (e.g. "40' rock saw inc")
+            if last_date is not None:
+                date_val = last_date  # fall through with carried date
+            else:
+                continue  # no prior date to carry, skip
+        else:
+            consecutive_empty = 0
+
         row_date = _to_date(date_val)
         if row_date is None:
             continue
+
+        last_date = row_date  # update carry-forward tracker
 
         def gc(key):
             idx = col.get(key)
@@ -367,11 +399,8 @@ def read_daily_report(filepath: Path, target_date: date) -> dict:
         report["all_entries"].append(entry)
 
     target_entries = [e for e in report["all_entries"] if e["date"] == target_date]
-    if target_entries:
-        report["today_entries"] = target_entries
-    elif report["all_entries"]:
-        report["today_entries"]   = [report["all_entries"][-1]]
-        report["used_last_entry"] = True
+    report["today_entries"] = target_entries
+    # No last-entry fallback: only work explicitly dated to target_date is counted.
 
     for wt in WORK_TYPES:
         report["today_values"][wt] = sum(e[wt] for e in report["today_entries"])
@@ -519,9 +548,9 @@ def _add_job_row(ws, section, job_number):
     insert_at = section["daily_row"]
     ws.insert_rows(insert_at)
     ws.cell(row=insert_at, column=2, value=job_number)
-    # If this is the first job row in the section, put the contractor name in col A
-    if not section["job_rows"]:
-        ws.cell(row=insert_at, column=1, value=section["name"])
+    # Do NOT write contractor name into col A here — the section header already
+    # has it at section["header_row"].  Writing it again creates a duplicate that
+    # confuses discover_sections on the next call.
 
 
 def sync_jobs(ws, reports: list) -> tuple:
@@ -964,9 +993,17 @@ def main():
     output_template = PRODUCTION_DIR  / f"Daily Production {date_str}.xlsx"
     output_crew     = CREW_REPORT_DIR / f"Crew Report {date_str}.xlsx"
 
-    # Look for reports in a date subfolder (YYYYMMDD) first, fall back to root Daily's/
+    # Look for reports in order of priority:
+    #   1. Daily's/YYYYMMDD/   (date-specific subfolder)
+    #   2. Daily's/            (general drop folder)
+    #   3. BASE_DIR            (root folder — reports placed there directly)
     date_subfolder = DAILY_DIR / target_date.strftime("%Y%m%d")
-    reports_dir    = date_subfolder if date_subfolder.is_dir() else DAILY_DIR
+    if date_subfolder.is_dir() and any(date_subfolder.glob("*.xlsx")):
+        reports_dir = date_subfolder
+    elif DAILY_DIR.is_dir() and any(DAILY_DIR.glob("*.xlsx")):
+        reports_dir = DAILY_DIR
+    else:
+        reports_dir = BASE_DIR
 
     sep = "-" * 72
     print(f"\n{sep}")
@@ -981,7 +1018,10 @@ def main():
     errors      = []
 
     # Only read .xlsx files that look like crew reports (skip templates, scripts, etc.)
-    SKIP_PATTERNS = ("daily production template", "daily_production_auto")
+    # "daily production template" — master template file
+    # "daily production "         — dated output copies (e.g. "Daily Production 04-13-2026.xlsx")
+    # "crew report"               — crew contribution output files
+    SKIP_PATTERNS = ("daily production template", "daily production ", "crew report", "daily_production_auto")
     for xlsx_file in sorted(reports_dir.glob("*.xlsx")):
         if any(p in xlsx_file.name.lower() for p in SKIP_PATTERNS):
             continue
